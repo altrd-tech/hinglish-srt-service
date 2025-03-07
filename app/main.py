@@ -1,0 +1,506 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import google.generativeai as genai
+import os
+import tempfile
+import uuid
+import time
+from dotenv import load_dotenv
+import asyncio
+import logging
+from datetime import timedelta
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Set up Google Gemini API
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable not set")
+
+genai.configure(api_key=GOOGLE_API_KEY)
+
+app = FastAPI(title="Hinglish Transcription Service")
+
+# Create temp directory for storing files
+TEMP_DIR = tempfile.mkdtemp()
+OUTPUT_DIR = os.path.join(TEMP_DIR, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Define system instruction for Gemini
+SYSTEM_INSTRUCTION = """
+You are a specialized transcription assistant focused on Hindi-English mixed audio (Hinglish).
+Your task is to transcribe the audio accurately, preserving the mixed language nature.
+Write the transcript in Roman script (not Devanagari), and format as a properly timed SRT file.
+Focus on natural Hinglish transcription without attempting to translate either to pure Hindi or English.
+"""
+
+# Helper function to convert seconds to SRT timestamp format (HH:MM:SS,mmm)
+def seconds_to_srt_timestamp(seconds):
+    td = timedelta(seconds=seconds)
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    milliseconds = int(td.microseconds / 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+# Convert text to SRT format
+def text_to_srt(transcript_text):
+    """Convert raw transcript to SRT format with timestamps"""
+    lines = transcript_text.strip().split('\n')
+    srt_content = []
+    
+    # If Gemini already returned SRT format, just clean it up
+    if lines and lines[0].isdigit() and '-->' in lines[1]:
+        return transcript_text
+    
+    # Create segments (approximately 5 seconds each)
+    segment_length = 5  # in seconds
+    total_duration = len(lines) * segment_length  # Rough estimate
+    
+    for i, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+            
+        start_time = (i-1) * segment_length
+        end_time = i * segment_length
+        
+        start_timestamp = seconds_to_srt_timestamp(start_time)
+        end_timestamp = seconds_to_srt_timestamp(end_time)
+        
+        srt_content.append(f"{i}\n{start_timestamp} --> {end_timestamp}\n{line}\n")
+    
+    return "\n".join(srt_content)
+
+# Process audio file and generate SRT
+async def process_audio(audio_path, output_path):
+    try:
+        # Upload file to Gemini
+        logger.info(f"Uploading audio file: {audio_path}")
+        audio_file = genai.upload_file(path=audio_path)
+        
+        # Set up the model with system instruction
+        model = genai.GenerativeModel(
+            model_name="models/gemini-2.0-flash",
+            system_instruction=SYSTEM_INSTRUCTION
+        )
+        
+        # Generate transcript
+        prompt = "Transcribe this audio file to Hinglish (Hindi-English mix) in SRT format. Use Roman script for Hindi words. Include proper timestamps."
+        logger.info("Sending request to Gemini API")
+        
+        response = model.generate_content(
+            [prompt, audio_file],
+            request_options={"timeout": 600}
+        )
+        
+        # Process the response
+        transcript_text = response.text
+        logger.info("Received transcript from Gemini")
+        
+        # Format as SRT if needed
+        srt_content = text_to_srt(transcript_text)
+        
+        # Write to file with UTF-8 encoding
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(srt_content)
+        
+        logger.info(f"SRT file created: {output_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error in processing audio: {str(e)}")
+        return False
+
+# Status tracking for jobs
+job_status = {}
+
+# Define API endpoints
+@app.post("/upload")
+async def upload_audio(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    # Generate unique ID for this job
+    job_id = str(uuid.uuid4())
+    
+    # Save the uploaded file
+    audio_path = os.path.join(TEMP_DIR, f"{job_id}_{file.filename}")
+    output_path = os.path.join(OUTPUT_DIR, f"{job_id}.srt")
+    
+    # Update job status
+    job_status[job_id] = {
+        "status": "processing",
+        "filename": file.filename,
+        "output": output_path
+    }
+    
+    # Save uploaded file
+    with open(audio_path, "wb") as buffer:
+        buffer.write(await file.read())
+    
+    # Process in background
+    background_tasks.add_task(process_audio_background, job_id, audio_path, output_path)
+    
+    return {"job_id": job_id, "status": "processing"}
+
+async def process_audio_background(job_id, audio_path, output_path):
+    """Background task for processing audio"""
+    try:
+        success = await process_audio(audio_path, output_path)
+        if success:
+            job_status[job_id]["status"] = "completed"
+        else:
+            job_status[job_id]["status"] = "failed"
+    except Exception as e:
+        logger.error(f"Background processing error: {str(e)}")
+        job_status[job_id]["status"] = "failed"
+    finally:
+        # Clean up the audio file
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+@app.get("/status/{job_id}")
+async def get_job_status(job_id: str):
+    """Check the status of a transcription job"""
+    if job_id not in job_status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return job_status[job_id]
+
+@app.get("/download/{job_id}")
+async def download_srt(job_id: str):
+    """Download the generated SRT file"""
+    if job_id not in job_status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = job_status[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail=f"Job is {job['status']}, not ready for download")
+    
+    original_filename = os.path.splitext(job["filename"])[0]
+    
+    return FileResponse(
+        path=job["output"],
+        filename=f"{original_filename}.srt",
+        media_type="application/x-subrip"
+    )
+
+# Main HTML UI
+@app.get("/", response_class=HTMLResponse)
+async def get_html():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Hinglish Transcription Tool</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+            body { 
+                font-family: 'Inter', sans-serif;
+                background-color: #f8f9fa;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 2rem;
+            }
+            .drag-area {
+                border: 2px dashed #0d6efd;
+                border-radius: 0.5rem;
+                padding: 2rem;
+                text-align: center;
+                transition: all 0.3s ease;
+            }
+            .drag-area:hover {
+                background-color: #f0f7ff;
+                cursor: pointer;
+            }
+            .drag-area.active {
+                border-color: #20c997;
+                background-color: #f0f7ff;
+            }
+            .progress {
+                height: 6px;
+            }
+            .file-details {
+                background-color: #f1f3f5;
+                border-radius: 0.5rem;
+                padding: 1rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="mb-5 text-center">
+                <h1 class="display-5 fw-bold mb-2">Hinglish Transcription Tool</h1>
+                <p class="text-muted">Upload Hindi/English mixed audio to get SRT subtitles in Hinglish</p>
+            </div>
+            
+            <div class="bg-white rounded-3 shadow-sm p-4">
+                <div id="uploadArea" class="drag-area mb-4">
+                    <div class="d-flex flex-column align-items-center">
+                        <i class="fas fa-cloud-upload-alt text-primary mb-3" style="font-size: 3rem;"></i>
+                        <h3 class="fs-5 fw-semibold mb-2">Drag & Drop your audio file</h3>
+                        <p class="text-muted mb-4">Or click to browse files</p>
+                        <button id="browseBtn" class="btn btn-primary px-4 py-2">Browse Files</button>
+                    </div>
+                </div>
+                
+                <input type="file" id="fileInput" accept="audio/*" class="d-none">
+                
+                <div id="fileDetails" class="d-none mb-4 file-details">
+                    <div class="d-flex align-items-center">
+                        <i class="fas fa-file-audio text-primary me-3" style="font-size: 1.5rem;"></i>
+                        <div class="flex-grow-1">
+                            <p id="fileName" class="fw-medium mb-0"></p>
+                            <p id="fileSize" class="text-muted small mb-0"></p>
+                        </div>
+                        <button id="removeFile" class="btn btn-link text-danger p-0" title="Remove file">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+                
+                <div id="processingArea" class="d-none">
+                    <div class="mb-2 d-flex justify-content-between align-items-center">
+                        <span id="statusText" class="small fw-medium">Processing...</span>
+                        <span id="percentText" class="small text-muted">0%</span>
+                    </div>
+                    <div class="progress mb-3">
+                        <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%"></div>
+                    </div>
+                </div>
+                
+                <div id="resultArea" class="d-none mt-4 alert alert-success">
+                    <div class="d-flex align-items-center mb-3">
+                        <i class="fas fa-check-circle text-success me-2" style="font-size: 1.5rem;"></i>
+                        <h3 class="fs-5 fw-semibold mb-0">Transcription Complete!</h3>
+                    </div>
+                    <p class="mb-3">Your Hinglish SRT file is ready for download.</p>
+                    <button id="downloadBtn" class="btn btn-success px-4 py-2">
+                        <i class="fas fa-download me-2"></i>Download SRT File
+                    </button>
+                </div>
+                
+                <div id="errorArea" class="d-none mt-4 alert alert-danger">
+                    <div class="d-flex align-items-center mb-3">
+                        <i class="fas fa-exclamation-circle text-danger me-2" style="font-size: 1.5rem;"></i>
+                        <h3 class="fs-5 fw-semibold mb-0">Processing Failed</h3>
+                    </div>
+                    <p id="errorText" class="mb-3">There was an error processing your audio file.</p>
+                    <button id="tryAgainBtn" class="btn btn-primary px-4 py-2">
+                        <i class="fas fa-redo me-2"></i>Try Again
+                    </button>
+                </div>
+            </div>
+            
+            <div class="mt-4 text-center">
+                <p class="small text-muted mb-1">Supports .mp3, .mp4, .wav, .m4a, and most other audio formats</p>
+                <p class="small text-muted">made with ❤️ by altrd</p>
+            </div>
+        </div>
+        
+        <script>
+            document.addEventListener('DOMContentLoaded', () => {
+                // Elements
+                const uploadArea = document.getElementById('uploadArea');
+                const fileInput = document.getElementById('fileInput');
+                const browseBtn = document.getElementById('browseBtn');
+                const fileDetails = document.getElementById('fileDetails');
+                const fileName = document.getElementById('fileName');
+                const fileSize = document.getElementById('fileSize');
+                const removeFile = document.getElementById('removeFile');
+                const processingArea = document.getElementById('processingArea');
+                const resultArea = document.getElementById('resultArea');
+                const errorArea = document.getElementById('errorArea');
+                const statusText = document.getElementById('statusText');
+                const percentText = document.getElementById('percentText');
+                const progressBar = document.getElementById('progressBar');
+                const downloadBtn = document.getElementById('downloadBtn');
+                const tryAgainBtn = document.getElementById('tryAgainBtn');
+                const errorText = document.getElementById('errorText');
+                
+                let selectedFile = null;
+                let currentJobId = null;
+                
+                // Event Listeners
+                browseBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    fileInput.click();
+                });
+                
+                uploadArea.addEventListener('click', () => fileInput.click());
+                
+                uploadArea.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    uploadArea.classList.add('active');
+                });
+                
+                uploadArea.addEventListener('dragleave', () => {
+                    uploadArea.classList.remove('active');
+                });
+                
+                uploadArea.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    uploadArea.classList.remove('active');
+                    
+                    if (e.dataTransfer.files.length) {
+                        handleFile(e.dataTransfer.files[0]);
+                    }
+                });
+                
+                fileInput.addEventListener('change', () => {
+                    if (fileInput.files.length) {
+                        handleFile(fileInput.files[0]);
+                    }
+                });
+                
+                removeFile.addEventListener('click', resetUI);
+                
+                tryAgainBtn.addEventListener('click', resetUI);
+                
+                // Handle selected file
+                function handleFile(file) {
+                    if (!file.type.startsWith('audio/') && !file.name.match(/\\.(mp3|mp4|wav|m4a|aac|ogg|flac)$/i)) {
+                        showError('Please select an audio file.');
+                        return;
+                    }
+                    
+                    selectedFile = file;
+                    
+                    // Show file details
+                    uploadArea.classList.add('d-none');
+                    fileDetails.classList.remove('d-none');
+                    fileName.textContent = file.name;
+                    fileSize.textContent = formatFileSize(file.size);
+                    
+                    // Start upload
+                    uploadFile(file);
+                }
+                
+                // Upload file
+                function uploadFile(file) {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    
+                    processingArea.classList.remove('d-none');
+                    updateProgress(0, 'Uploading...');
+                    
+                    fetch('/upload', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => {
+                        if (!response.ok) throw new Error('Upload failed');
+                        return response.json();
+                    })
+                    .then(data => {
+                        currentJobId = data.job_id;
+                        updateProgress(20, 'Processing audio...');
+                        pollStatus(data.job_id);
+                    })
+                    .catch(error => {
+                        showError(error.message);
+                    });
+                }
+                
+                // Poll job status
+                function pollStatus(jobId) {
+                    const checkStatus = () => {
+                        fetch(`/status/${jobId}`)
+                        .then(response => {
+                            if (!response.ok) throw new Error('Status check failed');
+                            return response.json();
+                        })
+                        .then(data => {
+                            if (data.status === 'processing') {
+                                // Increment progress for visual feedback
+                                const currentWidth = parseInt(progressBar.style.width || '20');
+                                const newWidth = Math.min(currentWidth + 5, 90);
+                                updateProgress(newWidth, 'Transcribing audio...');
+                                
+                                // Continue polling
+                                setTimeout(checkStatus, 2000);
+                                
+                            } else if (data.status === 'completed') {
+                                updateProgress(100, 'Complete!');
+                                processingArea.classList.add('d-none');
+                                resultArea.classList.remove('d-none');
+                                
+                                downloadBtn.addEventListener('click', () => {
+                                    window.location.href = `/download/${jobId}`;
+                                });
+                                
+                            } else {
+                                showError('Transcription failed. Please try again.');
+                            }
+                        })
+                        .catch(error => {
+                            showError(error.message);
+                        });
+                    };
+                    
+                    // Start polling
+                    checkStatus();
+                }
+                
+                // Format file size
+                function formatFileSize(bytes) {
+                    if (bytes < 1024) return bytes + ' bytes';
+                    else if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+                    else return (bytes / 1048576).toFixed(1) + ' MB';
+                }
+                
+                // Update progress bar
+                function updateProgress(percent, text) {
+                    progressBar.style.width = percent + '%';
+                    statusText.textContent = text;
+                    percentText.textContent = percent + '%';
+                }
+                
+                // Show error
+                function showError(message) {
+                    processingArea.classList.add('d-none');
+                    errorArea.classList.remove('d-none');
+                    errorText.textContent = message;
+                }
+                
+                // Reset UI
+                function resetUI() {
+                    selectedFile = null;
+                    currentJobId = null;
+                    
+                    // Reset file input
+                    fileInput.value = '';
+                    
+                    // Hide all sections
+                    fileDetails.classList.add('d-none');
+                    processingArea.classList.add('d-none');
+                    resultArea.classList.add('d-none');
+                    errorArea.classList.add('d-none');
+                    
+                    // Show upload area
+                    uploadArea.classList.remove('d-none');
+                    
+                    // Reset progress
+                    progressBar.style.width = '0%';
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
